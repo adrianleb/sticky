@@ -98,16 +98,17 @@ def aggregate(
     *,
     peer_salt: bytes,
     pack_lookup: Optional[dict[int, StickerReference]] = None,
-) -> dict[int, StickerUsage]:
+) -> tuple[dict[int, StickerUsage], dict[int, StickerUsage]]:
     """Roll sticker-send events into per-file_id usage stats.
 
-    `pack_lookup` maps a sticker document id to a StickerReference describing
-    the pack it belongs to. It's used to resolve referenced-media IDs on
-    outgoing messages — most sends from an installed pack show up as a bare
-    MediaId on the message, with the actual TelegramMediaFile living in the
-    ItemCollectionItemTable.
+    Returns `(resolved, unresolved)`:
+    - `resolved` — sticker sends we could attribute to a currently-installed pack.
+    - `unresolved` — sends via a bare `MediaId` whose document id isn't in
+      `pack_lookup` (typically: the user sent the sticker, then uninstalled
+      the pack). We still want to count these in the report.
     """
     rollup: dict[int, StickerUsage] = {}
+    unresolved: dict[int, StickerUsage] = {}
     for scan in scans:
         peer_hash = hash_peer(scan.index.peer_id, peer_salt)
         for ref in scan.stickers:
@@ -120,11 +121,20 @@ def aggregate(
                 )
                 rollup[ref.file_id] = usage
             usage.add(scan.index.timestamp, peer_hash, ref)
-        if not pack_lookup:
-            continue
         for ref_id in scan.referenced_ids:
-            resolved = pack_lookup.get(ref_id.id)
+            resolved = pack_lookup.get(ref_id.id) if pack_lookup else None
             if resolved is None:
+                synthetic = StickerReference(
+                    file_id=ref_id.id,
+                    access_hash=None,
+                    sticker_set_id=None,
+                    sticker_set_access_hash=None,
+                )
+                un = unresolved.get(ref_id.id)
+                if un is None:
+                    un = StickerUsage(file_id=ref_id.id)
+                    unresolved[ref_id.id] = un
+                un.add(scan.index.timestamp, peer_hash, synthetic)
                 continue
             usage = rollup.get(resolved.file_id)
             if usage is None:
@@ -135,7 +145,7 @@ def aggregate(
                 )
                 rollup[resolved.file_id] = usage
             usage.add(scan.index.timestamp, peer_hash, resolved)
-    return rollup
+    return rollup, unresolved
 
 
 def merge_usage(

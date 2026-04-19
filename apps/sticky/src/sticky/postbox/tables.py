@@ -204,6 +204,130 @@ def iter_pack_stickers(
             yield fid, parsed_key.collection_id, ah, emoji
 
 
+_MEDIA_ENTRY_HEADER_CANDIDATES: tuple[int, ...] = (5, 6, 4, 0)
+
+
+def _find_media_entry_payload(blob: bytes) -> Optional[bytes]:
+    """MessageHistoryMediaTable values have a small header before the PostboxCoding body.
+
+    The header holds a reference-count and record type; its size varies slightly
+    across TelegramSwift builds. We locate the `[0x01][0x5f][0x05]` sequence
+    (keylen=1, key="_", ValueType.OBJECT) that marks the root object's KV start
+    and return the slice from there.
+    """
+    for skip in _MEDIA_ENTRY_HEADER_CANDIDATES:
+        if len(blob) < skip + 9:
+            continue
+        if blob[skip] == 0x01 and blob[skip + 1] == 0x5F and blob[skip + 2] == 0x05:
+            return blob[skip:]
+    return None
+
+
+def iter_media_table_stickers(
+    conn, table: str
+) -> Iterator[tuple[int, Optional[int], Optional[int], Optional[int], Optional[str]]]:
+    """Yield (file_id, sticker_set_id, sticker_set_access_hash, access_hash, emoji)
+    for every sticker stored in the MessageHistoryMediaTable.
+
+    Unlike `iter_pack_stickers` (which only knows about currently-installed packs),
+    this table stores every media document referenced by any message — including
+    stickers from uninstalled packs or ad-hoc sends.
+    """
+    from .schema import TELEGRAM_MEDIA_FILE_ATTRIBUTE_HASH, DocumentAttributeType
+
+    for _key, value in conn.execute(f"SELECT key, value FROM {table}"):
+        if not isinstance(value, (bytes, bytearray)):
+            continue
+        vb = bytes(value)
+        payload = _find_media_entry_payload(vb)
+        if payload is None:
+            continue
+        try:
+            root = PostboxDecoder(payload).decode_root_object()
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(root, dict):
+            continue
+        if root.get("@type") != TELEGRAM_MEDIA_FILE_HASH:
+            continue
+
+        sticker_set_id: Optional[int] = None
+        sticker_set_access_hash: Optional[int] = None
+        emoji: Optional[str] = None
+        is_sticker = False
+        for attr in root.get("at") or []:
+            if not isinstance(attr, dict):
+                continue
+            if attr.get("@type") != TELEGRAM_MEDIA_FILE_ATTRIBUTE_HASH:
+                continue
+            if attr.get("t") != DocumentAttributeType.STICKER:
+                continue
+            is_sticker = True
+            pr = attr.get("pr")
+            if isinstance(pr, dict):
+                sticker_set_id = pr.get("i")
+                sticker_set_access_hash = pr.get("h")
+            dt = attr.get("dt")
+            if isinstance(dt, str) and dt:
+                emoji = dt
+        if not is_sticker:
+            continue
+
+        resource = root.get("r") or {}
+        fid = resource.get("f") if isinstance(resource, dict) else None
+        ah = resource.get("a") if isinstance(resource, dict) else None
+        if not isinstance(fid, int):
+            continue
+        yield (
+            int(fid),
+            int(sticker_set_id) if isinstance(sticker_set_id, int) else None,
+            int(sticker_set_access_hash)
+            if isinstance(sticker_set_access_hash, int)
+            else None,
+            int(ah) if isinstance(ah, int) else None,
+            emoji,
+        )
+
+
+def detect_media_reference_table(
+    conn, tables: list[PostboxTable]
+) -> Optional[str]:
+    """Find the KV table with 12-byte keys holding MessageHistoryMediaTable entries.
+
+    Identified by: key_length=12 AND at least one sampled value decodes as
+    TelegramMediaFile once the short record header is skipped.
+    """
+    best: tuple[int, int, str] | None = None
+    for t in tables:
+        if 12 not in t.key_lengths:
+            continue
+        try:
+            sample = conn.execute(
+                f"SELECT value FROM {t.name} LIMIT 200"
+            ).fetchall()
+        except Exception:  # noqa: BLE001
+            continue
+        hits = 0
+        for row in sample:
+            if not row or not isinstance(row[0], (bytes, bytearray)):
+                continue
+            payload = _find_media_entry_payload(bytes(row[0]))
+            if payload is None:
+                continue
+            try:
+                root = PostboxDecoder(payload).decode_root_object()
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(root, dict) and root.get("@type") == TELEGRAM_MEDIA_FILE_HASH:
+                hits += 1
+        if hits == 0:
+            continue
+        score = (hits, t.rows)
+        if best is None or score > (best[0], best[1]):
+            best = (hits, t.rows, t.name)
+    return best[2] if best else None
+
+
 def _iter_sticker_files(
     obj: object,
 ) -> Iterator[tuple[int, Optional[int], Optional[str]]]:

@@ -21,6 +21,7 @@ from .postbox import (
     detect_message_table,
     iter_item_collection_infos,
     iter_item_collection_items,
+    iter_media_table_stickers,
     iter_ordered_item_list,
     iter_outgoing_sticker_messages,
     iter_pack_stickers,
@@ -30,6 +31,7 @@ from .postbox import (
 from .postbox.tables import (
     detect_item_collection_info_table,
     detect_item_collection_item_table,
+    detect_media_reference_table,
     detect_ordered_item_list_tables,
 )
 
@@ -38,6 +40,7 @@ from .postbox.tables import (
 class ScanResult:
     snapshot_at: int
     usage: dict[int, StickerUsage]
+    unresolved: dict[int, StickerUsage]
     packs: list[dict]
     recent_stickers: list[dict]
     faved_stickers: list[dict]
@@ -64,6 +67,7 @@ def run_scan(
         info_table = detect_item_collection_info_table(conn, tables)
         item_table = detect_item_collection_item_table(conn, tables)
         ordered_names = detect_ordered_item_list_tables(conn, tables)
+        media_table = detect_media_reference_table(conn, tables)
 
         pack_lookup: dict[int, StickerReference] = {}
         if item_table is not None:
@@ -79,11 +83,29 @@ def run_scan(
                         sticker_set_access_hash=None,
                     ),
                 )
+        # Messages reference media by document id; MessageHistoryMediaTable
+        # stores every sticker the user has ever encountered (including
+        # uninstalled or never-installed packs). ICIT wins on conflict since
+        # it's the source of truth for currently-installed packs; the media
+        # table fills gaps for everything else.
+        if media_table is not None:
+            for fid, set_id, _set_ah, access_hash, _emoji in iter_media_table_stickers(
+                conn, media_table
+            ):
+                pack_lookup.setdefault(
+                    fid,
+                    StickerReference(
+                        file_id=fid,
+                        access_hash=access_hash,
+                        sticker_set_id=set_id,
+                        sticker_set_access_hash=None,
+                    ),
+                )
 
         sticker_messages = iter_outgoing_sticker_messages(
             conn, messages_table, since_ts=since_ts
         )
-        usage = aggregate(
+        usage, unresolved = aggregate(
             sticker_messages, peer_salt=peer_salt, pack_lookup=pack_lookup
         )
 
@@ -95,10 +117,21 @@ def run_scan(
             conn, ordered_names, OrderedItemListNamespace.CLOUD_SAVED_STICKERS
         )
 
-    last_ts = max((u.last_sent_at for u in usage.values() if u.last_sent_at), default=None)
+    last_ts = max(
+        (
+            ts
+            for ts in (
+                max((u.last_sent_at for u in usage.values() if u.last_sent_at), default=None),
+                max((u.last_sent_at for u in unresolved.values() if u.last_sent_at), default=None),
+            )
+            if ts is not None
+        ),
+        default=None,
+    )
     return ScanResult(
         snapshot_at=int(datetime.now(tz=timezone.utc).timestamp()),
         usage=usage,
+        unresolved=unresolved,
         packs=packs,
         recent_stickers=recent,
         faved_stickers=faved,

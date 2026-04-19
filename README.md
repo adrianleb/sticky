@@ -75,6 +75,7 @@ Nothing touches a third-party server; Sticky talks straight to
 ```sh
 sticky sync                         # re-scan Postbox (incremental, fast)
 sticky status                       # top stickers + pack heat
+sticky report --open                # HTML report of your sticker usage
 sticky packs create "All-time Top 30"
 sticky packs list
 sticky packs refresh <short_name>   # pull latest top-N into the set

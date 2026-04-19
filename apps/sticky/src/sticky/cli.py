@@ -31,6 +31,7 @@ from .packs import (
     refresh_pack,
 )
 from .rank import top_by_window
+from .report import gather as gather_report, render as render_report
 from .scan import ScanResult, run_scan
 
 app = typer.Typer(
@@ -286,9 +287,11 @@ def sync(
         with console.status("Scanning Postbox + writing local DB…"):
             acct, result, stats = asyncio.run(_run())
         elapsed = time.monotonic() - start
+        unresolved = stats.get("unresolved", 0)
+        extra = f", {unresolved} unresolved" if unresolved else ""
         console.print(
             f"[green]Synced {stats['stickers']} stickers, "
-            f"{stats['packs']} packs in {elapsed:.1f}s[/green] "
+            f"{stats['packs']} packs{extra} in {elapsed:.1f}s[/green] "
             f"(account {acct.display_id})."
         )
 
@@ -486,6 +489,50 @@ def packs_archive(
         f"  [cyan]{tg_url}[/cyan]\n"
         f"Web: [cyan]{install_url(short_name)}[/cyan]"
     )
+
+
+# ─── report ────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def report(
+    out: Path = typer.Option(
+        Path.home() / ".sticky" / "report.html",
+        "--out",
+        "-o",
+        help="Where to write the report. Use '-' for stdout.",
+    ),
+    open_in_browser: bool = typer.Option(
+        False, "--open", help="Open the report in your browser after writing."
+    ),
+) -> None:
+    """Write an HTML sticker-stats report to disk."""
+    cfg = _load_config()
+    acct = _resolve_account(cfg)
+
+    async def _run():
+        await _ensure_db()
+        async with session_scope(_engine()) as session:
+            data = await gather_report(
+                session,
+                cache_dir=acct.media_cache_dir,
+                account_id=cfg.account_id,
+            )
+        return render_report(data)
+
+    html = asyncio.run(_run())
+
+    if str(out) == "-":
+        sys.stdout.write(html)
+        return
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    console.print(f"[green]Wrote[/green] {out} ({len(html):,} bytes)")
+    if open_in_browser:
+        import webbrowser
+
+        webbrowser.open(out.as_uri())
 
 
 # ─── diagnose / cache ──────────────────────────────────────────────────────

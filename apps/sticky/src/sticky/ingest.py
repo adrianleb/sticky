@@ -12,7 +12,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .db import Pack, StickerUsage, SyncState
+from .db import Pack, StickerUsage, SyncState, UnresolvedSend
 from .scan import ScanResult
 
 
@@ -20,11 +20,13 @@ async def apply(session: AsyncSession, result: ScanResult) -> dict:
     """Merge a scan result into local state. Returns counts for the CLI."""
     sticker_count = await _upsert_usage(session, result)
     pack_count = await _upsert_packs(session, result)
+    unresolved_count = await _upsert_unresolved(session, result)
     await _recompute_heat_scores(session)
     await _update_sync_state(session, result)
     return {
         "stickers": sticker_count,
         "packs": pack_count,
+        "unresolved": unresolved_count,
         "last_timestamp": result.last_timestamp,
     }
 
@@ -105,6 +107,46 @@ def _merge_daily(existing: dict, new: dict) -> dict:
     for day, count in new.get("series", []):
         merged[day] = merged.get(day, 0) + count
     return {"series": sorted(merged.items())}
+
+
+async def _upsert_unresolved(session: AsyncSession, result: ScanResult) -> int:
+    """Merge unresolved sends into the UnresolvedSend table.
+
+    Stickers whose document id appears as `MediaId` on an outgoing message but
+    isn't in the installed-pack lookup. Most common cause: the pack was
+    uninstalled after the send. Counts are additive across syncs.
+    """
+    count = 0
+    for usage in result.unresolved.values():
+        existing = (
+            await session.execute(
+                select(UnresolvedSend).where(UnresolvedSend.file_id == usage.file_id)
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            session.add(
+                UnresolvedSend(
+                    file_id=usage.file_id,
+                    total_sends=usage.total_sends,
+                    first_sent_at=usage.first_sent_at,
+                    last_sent_at=usage.last_sent_at,
+                )
+            )
+        else:
+            existing.total_sends += usage.total_sends
+            if usage.first_sent_at is not None and (
+                existing.first_sent_at is None
+                or usage.first_sent_at < existing.first_sent_at
+            ):
+                existing.first_sent_at = usage.first_sent_at
+            if usage.last_sent_at is not None and (
+                existing.last_sent_at is None
+                or usage.last_sent_at > existing.last_sent_at
+            ):
+                existing.last_sent_at = usage.last_sent_at
+        count += 1
+    await session.flush()
+    return count
 
 
 async def _upsert_packs(session: AsyncSession, result: ScanResult) -> int:

@@ -99,6 +99,25 @@ class Pack(Base):
     )
 
 
+class UnresolvedSend(Base):
+    """Outgoing sticker sends whose MediaId didn't match any currently-installed pack.
+
+    Usually: user sent a sticker, then later uninstalled the pack. We can't look up
+    the sticker's full metadata anymore, but we still want to count the send.
+    """
+
+    __tablename__ = "unresolved_send"
+    __table_args__ = (Index("ix_unresolved_send_total", "total_sends"),)
+
+    file_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    total_sends: Mapped[int] = mapped_column(Integer, default=0)
+    first_sent_at: Mapped[Optional[int]] = mapped_column(BigInteger)
+    last_sent_at: Mapped[Optional[int]] = mapped_column(BigInteger)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
 class DynamicPack(Base):
     """A pack this user created via sticky (owned by their Telegram account)."""
 
