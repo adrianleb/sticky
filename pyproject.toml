@@ -1,0 +1,26 @@
+[project]
+name = "sticky-workspace"
+version = "0.0.0"
+description = "Sticky — Telegram sticker analytics + dynamic packs. Local-first agent, optional stateless bot proxy."
+requires-python = ">=3.13"
+
+[tool.uv.workspace]
+members = ["apps/sticky", "apps/proxy"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "N"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

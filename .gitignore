@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+.env
+.env.local
+*.local
+
+node_modules/
+.svelte-kit/
+apps/miniapp/build/
+
+# local agent state
+~/.config/sticky-agent/
+fixtures/*.db
+!fixtures/.gitkeep
+
+.DS_Store
+*.swp
