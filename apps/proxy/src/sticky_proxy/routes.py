@@ -4,7 +4,7 @@ import logging
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from .auth import decode_token, encode_token
@@ -208,3 +208,39 @@ async def get_sticker_set(
     bot_client: BotClient = Depends(get_bot_client),
 ) -> JSONResponse:
     return await _forward(bot_client, "getStickerSet", data={"name": payload.name})
+
+
+class GetFileRequest(BaseModel):
+    file_id: str
+
+
+@router.post("/bot/get_file")
+async def get_file(
+    payload: GetFileRequest,
+    _user_id: int = Depends(authenticated_user),
+    bot_client: BotClient = Depends(get_bot_client),
+) -> JSONResponse:
+    return await _forward(bot_client, "getFile", data={"file_id": payload.file_id})
+
+
+class DownloadFileRequest(BaseModel):
+    file_path: str
+
+
+@router.post("/bot/download_file")
+async def download_file(
+    payload: DownloadFileRequest,
+    _user_id: int = Depends(authenticated_user),
+    bot_client: BotClient = Depends(get_bot_client),
+) -> Response:
+    """Stream a sticker body through the proxy.
+
+    The `file_path` comes from a prior `getFile` call; the proxy owns the bot
+    token (needed to address `/file/bot<token>/...`) so the client can't fetch
+    directly in proxy mode.
+    """
+    try:
+        body = await bot_client.download(payload.file_path)
+    except BotApiError as exc:
+        return JSONResponse(status_code=502, content={"ok": False, "error": exc.body})
+    return Response(content=body, media_type="application/octet-stream")

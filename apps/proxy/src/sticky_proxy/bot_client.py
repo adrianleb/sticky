@@ -21,6 +21,7 @@ class BotClient:
     def __init__(self, token: str) -> None:
         self._token = token
         self._base = f"{BOT_API_BASE}/bot{token}"
+        self._file_base = f"{BOT_API_BASE}/file/bot{token}"
         self._client = httpx.AsyncClient(timeout=60.0)
 
     async def aclose(self) -> None:
@@ -43,3 +44,11 @@ class BotClient:
         if not resp.is_success or not payload.get("ok", False):
             raise BotApiError(resp.status_code, payload)
         return payload["result"]
+
+    async def download(self, file_path: str) -> bytes:
+        """Fetch a file by its Bot-API-issued `file_path` (from getFile)."""
+        url = f"{self._file_base}/{file_path}"
+        resp = await self._client.get(url)
+        if not resp.is_success:
+            raise BotApiError(resp.status_code, {"description": "download failed"})
+        return resp.content

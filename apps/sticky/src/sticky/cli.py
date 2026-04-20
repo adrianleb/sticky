@@ -21,6 +21,7 @@ from .account import TelegramAccount
 from .botapi import BotClient
 from .config import Config, ConfigError
 from .db import DynamicPack, Pack, StickerUsage, init_schema, make_engine, session_scope
+from .fetch_missing import FetchResult, fetch_dir, fetch_missing
 from .ingest import apply as apply_scan
 from .packs import (
     PackError,
@@ -533,6 +534,78 @@ def report(
         import webbrowser
 
         webbrowser.open(out.as_uri())
+
+
+# ─── fetch-missing ─────────────────────────────────────────────────────────
+
+
+@app.command("fetch-missing")
+def fetch_missing_cmd(
+    limit: Optional[int] = typer.Option(
+        None, "--limit", help="Cap the number of fetches (for testing)."
+    ),
+    quiet: bool = typer.Option(False, "--quiet"),
+) -> None:
+    """Download animated bodies for used stickers whose full file isn't on disk.
+
+    Telegram-macOS doesn't cache the animated body of a sticker you sent from
+    the picker without rendering the pack's detail view — so top stickers
+    often have no local TGS/WebM. This pulls them through the Bot API
+    (`getStickerSet` + `getFile`) and stores them under `~/.sticky/media/`
+    where the report picks them up.
+    """
+    cfg = _load_config()
+    acct = _resolve_account(cfg)
+
+    async def _run() -> FetchResult:
+        await _ensure_db()
+        bot = _bot_client(cfg)
+        try:
+            async with session_scope(_engine()) as session:
+                if quiet:
+                    return await fetch_missing(session, bot, acct, limit=limit)
+                from rich.progress import (
+                    BarColumn,
+                    Progress,
+                    TextColumn,
+                    TimeRemainingColumn,
+                )
+
+                progress = Progress(
+                    TextColumn("[bold]Fetching[/bold]"),
+                    BarColumn(),
+                    TextColumn("{task.completed}/{task.total}"),
+                    TextColumn("{task.fields[label]}", style="dim"),
+                    TimeRemainingColumn(),
+                    console=console,
+                    transient=True,
+                )
+                with progress:
+                    task_id = progress.add_task("fetch", total=1, label="…")
+
+                    def _cb(done: int, total: int, label: str) -> None:
+                        progress.update(task_id, total=total, completed=done, label=label)
+
+                    result = await fetch_missing(
+                        session, bot, acct, limit=limit, on_progress=_cb
+                    )
+                    progress.update(task_id, completed=result.fetched + result.skipped + result.failed)
+                return result
+        finally:
+            await bot.aclose()
+
+    result = asyncio.run(_run())
+    dest = fetch_dir()
+    console.print(
+        f"[green]Fetched[/green] {result.fetched} "
+        f"({result.total_bytes / 1024:.1f} KB) → {dest}\n"
+        f"skipped {result.skipped}, failed {result.failed}"
+    )
+    if result.failures and not quiet:
+        for ref, msg in result.failures[:10]:
+            console.print(f"  [yellow]{ref}[/yellow]: {msg}")
+        if len(result.failures) > 10:
+            console.print(f"  … {len(result.failures) - 10} more")
 
 
 # ─── diagnose / cache ──────────────────────────────────────────────────────

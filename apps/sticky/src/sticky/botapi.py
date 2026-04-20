@@ -208,6 +208,35 @@ class BotClient:
         path = "/bot/get_sticker_set" if self._config.is_proxy() else "getStickerSet"
         return await self._post_json(path, {"name": name})
 
+    async def get_file(self, bot_file_id: str) -> dict:
+        path = "/bot/get_file" if self._config.is_proxy() else "getFile"
+        return await self._post_json(path, {"file_id": bot_file_id})
+
+    async def download_file_bytes(self, file_path: str) -> bytes:
+        """Fetch the raw bytes of a file returned by `get_file`.
+
+        Proxy mode routes through the proxy (which holds the bot token); local
+        mode hits the Telegram file CDN directly.
+        """
+        async with self._api_gate:
+            if self._config.is_proxy():
+                url = self._proxy_url("/bot/download_file")
+                resp = await self._client.post(
+                    url, json={"file_path": file_path}, headers=self._auth_headers()
+                )
+                if not resp.is_success:
+                    try:
+                        body = resp.json()
+                    except Exception:
+                        body = {"raw": resp.text}
+                    raise BotApiError(resp.status_code, body)
+                return resp.content
+            url = f"{BOT_API_BASE}/file/bot{self._config.bot_token}/{file_path}"
+            resp = await self._client.get(url)
+            if not resp.is_success:
+                raise BotApiError(resp.status_code, {"description": "download failed"})
+            return resp.content
+
     async def send_message_to_self(self, text: str, *, parse_mode: str | None = None) -> dict:
         if self._config.is_proxy():
             payload: dict = {"text": text}

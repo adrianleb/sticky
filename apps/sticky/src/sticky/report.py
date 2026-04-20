@@ -89,41 +89,73 @@ def _thumb_for_id(
     return index.get(file_id)
 
 
-def _build_video_index(media_dir: Path) -> dict[int, Path]:
-    """Find full-document WebM files keyed by file_id.
+@dataclass
+class MediaBody:
+    path: Path
+    kind: str  # 'webm' | 'tgs' | 'webp'
 
-    `postbox/media/` holds the actual sticker documents — TGS (gzipped
-    Lottie JSON), WebM (video stickers), WebP (static). Cached rendered
-    previews live under `cache/`. We only surface WebM here because
-    browsers play WebM natively via `<video>` without any extra library.
+
+def _sniff_kind(head: bytes) -> str | None:
+    if head.startswith(b"\x1a\x45\xdf\xa3"):  # EBML
+        return "webm"
+    if head.startswith(b"\x1f\x8b"):  # gzip → TGS
+        return "tgs"
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _scan_media_dir(directory: Path, accept: tuple[str, ...]) -> dict[int, MediaBody]:
+    """Walk a flat media directory, return {file_id: MediaBody} for accepted kinds.
+
+    Handles both Postbox's `telegram-cloud-document-<ns>-<fid>` flat files
+    and our fetch dir's plain integer filenames.
     """
-    found: dict[int, Path] = {}
+    found: dict[int, MediaBody] = {}
     try:
-        it = os.scandir(media_dir)
+        it = os.scandir(directory)
     except OSError:
         return {}
     with it:
         for entry in it:
+            if not entry.is_file():
+                continue
             name = entry.name
-            if not name.startswith("telegram-cloud-document-"):
-                continue
-            if "-size-" in name or "_partial" in name or name.endswith(".meta"):
-                continue
             fid: int | None = None
-            for part in reversed(name.split("-")):
-                if part.isdigit() and len(part) >= 10:
-                    fid = int(part)
-                    break
+            if name.startswith("telegram-cloud-document-"):
+                if "-size-" in name or "_partial" in name or name.endswith(".meta"):
+                    continue
+                for part in reversed(name.split("-")):
+                    if part.isdigit() and len(part) >= 10:
+                        fid = int(part)
+                        break
+            elif name.isdigit():
+                fid = int(name)
             if fid is None:
                 continue
             try:
                 with open(entry.path, "rb") as f:
-                    head = f.read(4)
+                    head = f.read(16)
             except OSError:
                 continue
-            if head.startswith(b"\x1a\x45\xdf\xa3"):  # EBML → WebM
-                found[fid] = Path(entry.path)
+            kind = _sniff_kind(head)
+            if kind is None or kind not in accept:
+                continue
+            found[fid] = MediaBody(Path(entry.path), kind)
     return found
+
+
+def _build_media_index(media_dir: Path, fetch_dir: Path) -> dict[int, MediaBody]:
+    """Find full-document sticker bodies keyed by file_id.
+
+    `postbox/media/` holds Telegram-macOS's own sticker documents. Our
+    `~/.sticky/media/` holds bodies pulled via the Bot API (`sticky
+    fetch-missing`). Postbox files take precedence when both are present.
+    """
+    fetched = _scan_media_dir(fetch_dir, accept=("webm", "tgs", "webp"))
+    local = _scan_media_dir(media_dir, accept=("webm", "tgs", "webp"))
+    fetched.update(local)
+    return fetched
 
 
 @dataclass
@@ -142,6 +174,8 @@ class StickerCell:
     sends: int
     thumb_src: str | None
     video_src: str | None
+    tgs_src: str | None
+    webp_src: str | None
     last_sent: str | None
 
 
@@ -194,9 +228,10 @@ async def gather(
     """Pull everything the report needs out of the local DB."""
     all_usage = (await session.execute(select(StickerUsage))).scalars().all()
     thumb_index = _build_thumb_index(cache_dir)
-    video_index = _build_video_index(cache_dir.parent)
+    fetch_base = Path.home() / ".sticky" / "media"
+    media_index = _build_media_index(cache_dir.parent, fetch_base)
     thumb_cache: dict[int, str | None] = {}
-    video_cache: dict[int, str | None] = {}
+    media_cache: dict[int, dict[str, str | None]] = {}
 
     def cached_thumb(file_id: int) -> str | None:
         if file_id in thumb_cache:
@@ -214,24 +249,39 @@ async def gather(
         thumb_cache[file_id] = src
         return src
 
-    def cached_video(file_id: int) -> str | None:
-        if file_id in video_cache:
-            return video_cache[file_id]
-        path = video_index.get(file_id)
-        if path is None:
-            video_cache[file_id] = None
-            return None
-        try:
-            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-            src = f"data:video/webm;base64,{encoded}"
-        except OSError:
-            src = None
-        video_cache[file_id] = src
-        return src
+    _MIME_BY_KIND = {
+        "webm": "video/webm",
+        "tgs": "application/gzip",
+        "webp": "image/webp",
+    }
 
-    def cell_assets(file_id: int) -> tuple[str | None, str | None]:
-        """Return (thumb_src, video_src). Video shown when available; thumb is static fallback."""
-        return cached_thumb(file_id), cached_video(file_id)
+    def cached_media(file_id: int) -> dict[str, str | None]:
+        cached = media_cache.get(file_id)
+        if cached is not None:
+            return cached
+        entry = media_index.get(file_id)
+        out: dict[str, str | None] = {"video": None, "tgs": None, "webp": None}
+        if entry is not None:
+            try:
+                raw = entry.path.read_bytes()
+                encoded = base64.b64encode(raw).decode("ascii")
+                src = f"data:{_MIME_BY_KIND[entry.kind]};base64,{encoded}"
+                if entry.kind == "webm":
+                    out["video"] = src
+                elif entry.kind == "tgs":
+                    out["tgs"] = src
+                elif entry.kind == "webp":
+                    out["webp"] = src
+            except OSError:
+                pass
+        media_cache[file_id] = out
+        return out
+
+    def cell_assets(file_id: int) -> tuple[str | None, str | None, str | None, str | None]:
+        """Return (thumb_src, video_src, tgs_src, webp_src)."""
+        thumb = cached_thumb(file_id)
+        media = cached_media(file_id)
+        return thumb, media["video"], media["tgs"], media["webp"]
 
     sync_row = (
         await session.execute(select(SyncState).where(SyncState.id == 1))
@@ -307,7 +357,7 @@ async def gather(
             if row.last_sent_at
             else None
         )
-        thumb_src, video_src = cell_assets(row.file_id)
+        thumb_src, video_src, tgs_src, webp_src = cell_assets(row.file_id)
         unresolved_cells.append(
             StickerCell(
                 rank=i + 1,
@@ -315,6 +365,8 @@ async def gather(
                 sends=row.total_sends,
                 thumb_src=thumb_src,
                 video_src=video_src,
+                tgs_src=tgs_src,
+                webp_src=webp_src,
                 last_sent=last,
             )
         )
@@ -379,6 +431,8 @@ def _cell(
     rank: int,
     thumb_src: str | None,
     video_src: str | None,
+    tgs_src: str | None,
+    webp_src: str | None,
     *,
     for_window: str,
 ) -> StickerCell:
@@ -393,6 +447,8 @@ def _cell(
         sends=_windowed_sends(usage, for_window),
         thumb_src=thumb_src,
         video_src=video_src,
+        tgs_src=tgs_src,
+        webp_src=webp_src,
         last_sent=last,
     )
 
@@ -488,6 +544,8 @@ h2 { font-size: 16px; font-weight: 600; margin: 44px 0 14px; letter-spacing: -0.
 .cell { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 10px 8px 8px; text-align: center; position: relative; }
 .cell .thumb { height: 88px; display: flex; align-items: center; justify-content: center; }
 .cell img, .cell video { max-width: 88px; max-height: 88px; width: auto; height: auto; display: block; }
+.cell .tgs { width: 88px; height: 88px; }
+.cell .tgs svg { width: 100%; height: 100%; display: block; }
 .cell .placeholder { width: 88px; height: 88px; background: #fff; border: 1px dashed var(--border); border-radius: 6px; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); font-size: 10px; }
 .cell .rank { position: absolute; top: 6px; left: 8px; font-size: 10px; color: var(--muted); }
 .cell .sends { font-weight: 600; font-size: 14px; }
@@ -506,6 +564,7 @@ details.pack summary::before { content: "▸"; display: inline-block; width: 14p
 details.pack[open] summary::before { transform: rotate(90deg); }
 .pack-title { font-weight: 600; }
 .pack-meta { margin-left: 6px; }
+.tgs-fallback { width: 88px; height: 88px; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); font-size: 10px; background: #fff; border: 1px dashed var(--border); border-radius: 6px; }
 footer { margin-top: 48px; color: var(--muted); font-size: 12px; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -516,6 +575,10 @@ a:hover { text-decoration: underline; }
 {% macro sticker_thumb(c) -%}
   {%- if c.video_src -%}
     <div class="thumb"><video src="{{ c.video_src }}" autoplay loop muted playsinline disableremoteplayback></video></div>
+  {%- elif c.tgs_src -%}
+    <div class="thumb"><div class="tgs" data-tgs="{{ c.tgs_src }}"></div></div>
+  {%- elif c.webp_src -%}
+    <div class="thumb"><img src="{{ c.webp_src }}" alt=""></div>
   {%- elif c.thumb_src -%}
     <div class="thumb"><img src="{{ c.thumb_src }}" alt=""></div>
   {%- else -%}
@@ -644,6 +707,48 @@ Generated by <a href="https://github.com/adrianleb/sticky">Sticky</a> · {{ data
 </footer>
 
 </div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/lottie-web/5.12.2/lottie_light.min.js" crossorigin="anonymous"></script>
+<script>
+(function () {
+  const nodes = document.querySelectorAll('.tgs[data-tgs]');
+  if (!nodes.length) return;
+  const hasLottie = typeof lottie !== 'undefined';
+  const hasDecompression = typeof DecompressionStream !== 'undefined';
+  if (!hasLottie || !hasDecompression) {
+    nodes.forEach((n) => {
+      n.outerHTML = '<div class="tgs-fallback">tgs</div>';
+    });
+    return;
+  }
+  async function decode(uri) {
+    const resp = await fetch(uri);
+    const stream = resp.body.pipeThrough(new DecompressionStream('gzip'));
+    const text = await new Response(stream).text();
+    return JSON.parse(text);
+  }
+  const io = new IntersectionObserver((entries, obs) => {
+    entries.forEach((e) => {
+      if (!e.isIntersecting) return;
+      obs.unobserve(e.target);
+      const node = e.target;
+      const uri = node.getAttribute('data-tgs');
+      node.removeAttribute('data-tgs');
+      decode(uri).then((animationData) => {
+        lottie.loadAnimation({
+          container: node,
+          renderer: 'svg',
+          loop: true,
+          autoplay: true,
+          animationData,
+        });
+      }).catch(() => {
+        node.outerHTML = '<div class="tgs-fallback">tgs err</div>';
+      });
+    });
+  }, { rootMargin: '200px' });
+  nodes.forEach((n) => io.observe(n));
+})();
+</script>
 </body>
 </html>
 """
